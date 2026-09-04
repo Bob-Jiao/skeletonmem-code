@@ -265,6 +265,12 @@ class Trainer:
         self.micro_batches_seen = 0
         self.batches_in_epoch = 0
         self.train_loader_iter = None
+        self.interrupt_after_microbatches = getattr(
+            config, "lineage_interrupt_after_microbatches", None
+        )
+        self.interrupt_exit_code = int(
+            getattr(config, "lineage_interrupt_exit_code", 42)
+        )
 
         if self.resume_from:
             manifest_path = Path(self.resume_from) / "manifest.json"
@@ -302,7 +308,7 @@ class Trainer:
 
         self.base_transformer_path = transformer_path
         self.base_transformer_fingerprint = _transformer_fingerprint(transformer_path)
-        if self.resume_manifest is not None:
+        if self.resume_manifest is not None and self.training_mode == "lora":
             expected_fingerprint = self.resume_manifest.get("base_transformer_fingerprint")
             if expected_fingerprint != self.base_transformer_fingerprint:
                 raise ValueError(
@@ -1107,22 +1113,37 @@ class Trainer:
                 microbatch_id=self.micro_batches_seen - 1,
                 gradient_accumulation_index=micro_idx,
             )
+            if (
+                self.interrupt_after_microbatches is not None
+                and self.micro_batches_seen >= int(self.interrupt_after_microbatches)
+            ):
+                logger.error(
+                    "Forced lineage interruption after microbatch %d before optimizer update.",
+                    self.micro_batches_seen - 1,
+                )
+                os._exit(self.interrupt_exit_code)
         
         requires_gradient_sync = should_sync or (
             self.packing_enabled and self.sync_packed_gradients_each_microbatch
         )
         self.transformer.set_requires_gradient_sync(requires_gradient_sync)
 
+        fb_started = time.perf_counter()
         output = self.transformer(input_dict, train_mode=True)
         latent_loss, action_loss = self.compute_loss(input_dict, output)
         loss = latent_loss + action_loss
 
         loss.backward()
+        if self.lineage_tracer is not None:
+            self.lineage_tracer.add_timing(
+                "forward_backward_wall_clock_s", time.perf_counter() - fb_started
+            )
 
         losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
         
         # Only update weights after accumulating gradients
         if should_sync:
+            opt_started = time.perf_counter()
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
             self.optimizer.step()
             self.lr_scheduler.step()
@@ -1132,6 +1153,9 @@ class Trainer:
                 self.global_samples_seen += self.global_episodes_per_update
             if self.lineage_tracer is not None:
                 self.lineage_tracer.commit_update(self.step)
+                self.lineage_tracer.add_timing(
+                    "optimizer_update_wall_clock_s", time.perf_counter() - opt_started
+                )
             
             losses['total_norm'] = total_norm
             losses['should_log'] = True
@@ -1439,10 +1463,28 @@ class Trainer:
             map_location="cpu",
             weights_only=False,
         )
+        if self.training_mode == "full":
+            state = optimizer_state.setdefault("state", {})
+            missing_optimizer_state_keys = []
+            for group in optimizer_state.get("param_groups", []):
+                for fqn in group.get("params", []):
+                    if fqn not in state:
+                        state[fqn] = {}
+                        missing_optimizer_state_keys.append(fqn)
+            if missing_optimizer_state_keys and self.config.rank == 0:
+                logger.warning(
+                    "Full checkpoint optimizer state had %d param group entries with no slot state; "
+                    "restored them as empty AdamW states. First examples: %s",
+                    len(missing_optimizer_state_keys),
+                    missing_optimizer_state_keys[:5],
+                )
         set_optimizer_state_dict(
             self.transformer, self.optimizer,
             optim_state_dict=optimizer_state,
-            options=StateDictOptions(full_state_dict=True, strict=not topology_changed),
+            options=StateDictOptions(
+                full_state_dict=True,
+                strict=(not topology_changed and self.training_mode == "lora"),
+            ),
         )
         scheduler_state = torch.load(
             trainer_state_dir / "scheduler.pt",
@@ -1527,10 +1569,17 @@ class Trainer:
         accumulated_episode_count = 0
         step_in_accumulation = 0
         update_started_at = time.perf_counter()
+        end_to_end_started_at = time.perf_counter()
 
         while self.step < self.config.num_steps:
             # Get next batch (handles epoch reset automatically)
+            dataloader_started = time.perf_counter()
             batch = self._get_next_batch()
+            if self.lineage_tracer is not None:
+                self.lineage_tracer.add_timing(
+                    "dataloader_wait_wall_clock_s",
+                    time.perf_counter() - dataloader_started,
+                )
             
             losses = self._train_step(batch, step_in_accumulation)
             
@@ -1622,12 +1671,21 @@ class Trainer:
                 if self.step % self.config.save_interval == 0:
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
+                    checkpoint_started = time.perf_counter()
                     self.save_checkpoint()
+                    if self.lineage_tracer is not None:
+                        self.lineage_tracer.add_timing(
+                            "checkpoint_IO_wall_clock_s",
+                            time.perf_counter() - checkpoint_started,
+                        )
                 update_started_at = time.perf_counter()
         progress_bar.close()
         logger.info("Training completed!")
         if self.lineage_tracer is not None:
             torch.cuda.synchronize()
+            self.lineage_tracer.add_timing(
+                "end_to_end_wall_clock_s", time.perf_counter() - end_to_end_started_at
+            )
             self.lineage_tracer.finalize_rank(
                 peak_vram_bytes=int(torch.cuda.max_memory_allocated(self.device))
             )
@@ -1700,6 +1758,21 @@ def run(args):
         )
         config.lineage_source_view = args.lineage_source_view
         config.lineage_subset_manifest_id = args.lineage_subset_manifest_id
+        config.lineage_logical_run_id = (
+            args.lineage_logical_run_id or config.lineage_run_id
+        )
+        config.lineage_training_attempt_id = (
+            args.lineage_training_attempt_id
+            or f"{config.lineage_run_id}_rank{rank}_attempt0"
+        )
+        config.lineage_resume_generation = int(args.lineage_resume_generation)
+        config.lineage_checkpoint_base_step = int(args.lineage_checkpoint_base_step)
+        config.lineage_shard_steps = int(args.lineage_shard_steps)
+        if args.lineage_interrupt_after_microbatches is not None:
+            config.lineage_interrupt_after_microbatches = int(
+                args.lineage_interrupt_after_microbatches
+            )
+            config.lineage_interrupt_exit_code = int(args.lineage_interrupt_exit_code)
     if args.load_worker is not None:
         if args.load_worker < 0:
             raise ValueError("--load-worker must be non-negative")
@@ -1827,6 +1900,48 @@ def main():
         type=str,
         default=None,
         help="Run id stored in lineage artifacts.",
+    )
+    parser.add_argument(
+        "--lineage-logical-run-id",
+        type=str,
+        default=None,
+        help="Stable logical run id used for occurrence_id hashing across attempts.",
+    )
+    parser.add_argument(
+        "--lineage-training-attempt-id",
+        type=str,
+        default=None,
+        help="Attempt id stored in lineage records for resume auditing.",
+    )
+    parser.add_argument(
+        "--lineage-resume-generation",
+        type=int,
+        default=0,
+        help="Monotonic resume generation used to accept the final training trajectory.",
+    )
+    parser.add_argument(
+        "--lineage-checkpoint-base-step",
+        type=int,
+        default=0,
+        help="Optimizer step of the checkpoint used to start this attempt.",
+    )
+    parser.add_argument(
+        "--lineage-shard-steps",
+        type=int,
+        default=50,
+        help="Flush rank-local lineage parquet after this many committed optimizer steps.",
+    )
+    parser.add_argument(
+        "--lineage-interrupt-after-microbatches",
+        type=int,
+        default=None,
+        help="Force process exit after capturing this absolute microbatch count.",
+    )
+    parser.add_argument(
+        "--lineage-interrupt-exit-code",
+        type=int,
+        default=42,
+        help="Exit code used by the forced lineage interruption hook.",
     )
     parser.add_argument(
         "--lineage-source-view",

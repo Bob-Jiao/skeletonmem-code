@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import resource
 import socket
 import subprocess
 import time
@@ -18,6 +19,12 @@ import torch
 
 
 LINEAGE_FORMAT_VERSION = 1
+
+
+def _peak_rss_bytes() -> int:
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Linux reports KiB; macOS reports bytes. This runtime is Linux.
+    return int(value) * 1024
 
 
 def _json_default(value: Any) -> Any:
@@ -373,6 +380,14 @@ def write_json(path: str | Path, payload: Any) -> None:
     Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
 
 
+def atomic_write_json(path: str | Path, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
+    os.replace(tmp, path)
+
+
 def _git_state(repo_root: Path) -> dict[str, Any]:
     try:
         commit = subprocess.check_output(
@@ -442,15 +457,36 @@ class LineageTracer:
         self.source_view = source_view
         self.subset_manifest_id = subset_manifest_id
         self.sampler_probability = sampler_probability
-        self.records: list[dict[str, Any]] = []
+        self.logical_run_id = str(getattr(config, "lineage_logical_run_id", run_id))
+        self.training_attempt_id = str(
+            getattr(config, "lineage_training_attempt_id", f"{run_id}_rank{self.rank}")
+        )
+        self.resume_generation = int(getattr(config, "lineage_resume_generation", 0))
+        self.checkpoint_base_step = int(getattr(config, "lineage_checkpoint_base_step", 0))
+        self.shard_steps = int(getattr(config, "lineage_shard_steps", 50))
+        if self.shard_steps <= 0:
+            raise ValueError("lineage_shard_steps must be positive")
+        self.shard_buffer: list[dict[str, Any]] = []
         self.pending: defaultdict[int, list[dict[str, Any]]] = defaultdict(list)
-        self.microbatch_signatures: list[dict[str, Any]] = []
+        self.pending_signatures: defaultdict[int, list[dict[str, Any]]] = defaultdict(list)
+        self.part_id = 0
+        self.shard_start_step: int | None = None
+        self.shard_end_step: int | None = None
+        self.shards: list[dict[str, Any]] = []
+        self.flush_wall_clock_s = 0.0
+        self.max_buffered_records = 0
+        self.max_pending_records = 0
+        self.dropped_pending_records = 0
+        self.accepted_steps: set[int] = set()
         self.started_wall_time = time.time()
         self.started_perf = time.perf_counter()
+        self.timing = defaultdict(float)
+        self.timing_counts = Counter()
         self.repo_root = Path(__file__).resolve().parents[1]
 
         self.retained_ids: set[str] | None = None
         self.eligible_ids: set[str] | None = None
+        support_scan_started = time.perf_counter()
         if compute_support:
             support_ids = support_ids_from_dataset(dataset)
             self.retained_ids = set(support_ids)
@@ -467,6 +503,7 @@ class LineageTracer:
                     "source": "dataset.get_lineage_metadata over all dataset indices",
                 },
             )
+        self.support_scan_wall_clock_s = time.perf_counter() - support_scan_started
 
         manifest_hash = getattr(dataset, "packing_manifest_hash", None)
         if manifest_hash is None and hasattr(sampler, "manifest_hash"):
@@ -474,6 +511,11 @@ class LineageTracer:
         dry_run_manifest = {
             "format_version": LINEAGE_FORMAT_VERSION,
             "run_id": self.run_id,
+            "logical_run_id": self.logical_run_id,
+            "training_attempt_id": self.training_attempt_id,
+            "resume_generation": self.resume_generation,
+            "checkpoint_base_step": self.checkpoint_base_step,
+            "lineage_shard_steps": self.shard_steps,
             "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "host": socket.gethostname(),
             "repo": str(self.repo_root),
@@ -482,6 +524,7 @@ class LineageTracer:
             "dataset_fingerprint": getattr(dataset, "dataset_fingerprint", None),
             "packing_manifest_hash": manifest_hash,
             "subset_manifest_id": subset_manifest_id,
+            "support_scan_wall_clock_s": self.support_scan_wall_clock_s,
             "subset_manifest_sha256": (
                 sha256_file(subset_manifest_id)
                 if subset_manifest_id and Path(subset_manifest_id).is_file()
@@ -519,6 +562,72 @@ class LineageTracer:
         )
         if self.rank == 0:
             write_json(self.output_dir / "dry_run_manifest.json", dry_run_manifest)
+        atomic_write_json(
+            self.output_dir / f"attempt_rank{self.rank}_{self.training_attempt_id}.json",
+            dry_run_manifest,
+        )
+
+    def add_timing(self, key: str, seconds: float) -> None:
+        self.timing[key] += float(seconds)
+        self.timing_counts[key] += 1
+
+    def _occurrence_id(
+        self, *, optimizer_step: int, microbatch_id: int, sample_slot: int
+    ) -> str:
+        return stable_hash(
+            {
+                "logical_run_id": self.logical_run_id,
+                "optimizer_step": int(optimizer_step),
+                "rank": self.rank,
+                "microbatch_id": int(microbatch_id),
+                "sample_slot": int(sample_slot),
+            }
+        )
+
+    def _signature_path(self) -> Path:
+        return self.output_dir / f"batch_signatures_rank{self.rank}.jsonl"
+
+    def _append_signature(self, signature: dict[str, Any]) -> None:
+        with self._signature_path().open("a") as file:
+            file.write(json.dumps(signature, sort_keys=True, default=_json_default) + "\n")
+
+    def _flush_shard(self) -> None:
+        if not self.shard_buffer:
+            return
+        start = int(self.shard_start_step if self.shard_start_step is not None else 0)
+        end = int(self.shard_end_step if self.shard_end_step is not None else start)
+        part_id = self.part_id
+        lineage_part_id = f"rank{self.rank}_steps{start}_{end}_part{part_id}"
+        for record in self.shard_buffer:
+            record["lineage_part_id"] = lineage_part_id
+        final_path = (
+            self.output_dir
+            / f"lineage_rank{self.rank}_steps{start}_{end}_part{part_id}.parquet"
+        )
+        tmp_path = final_path.with_suffix(final_path.suffix + f".tmp.{os.getpid()}")
+        started = time.perf_counter()
+        table = pa.Table.from_pylist(self.shard_buffer)
+        pq.write_table(table, tmp_path)
+        os.replace(tmp_path, final_path)
+        elapsed = time.perf_counter() - started
+        self.flush_wall_clock_s += elapsed
+        self.shards.append(
+            {
+                "rank": self.rank,
+                "lineage_part_id": lineage_part_id,
+                "path": str(final_path),
+                "sha256": sha256_file(final_path),
+                "start_step": start,
+                "end_step": end,
+                "record_count": len(self.shard_buffer),
+                "bytes": final_path.stat().st_size,
+                "flush_wall_clock_s": elapsed,
+            }
+        )
+        self.part_id += 1
+        self.shard_buffer = []
+        self.shard_start_step = None
+        self.shard_end_step = None
 
     def capture_microbatch(
         self,
@@ -577,6 +686,16 @@ class LineageTracer:
             record = {
                 "format_version": LINEAGE_FORMAT_VERSION,
                 "run_id": self.run_id,
+                "logical_run_id": self.logical_run_id,
+                "training_attempt_id": self.training_attempt_id,
+                "resume_generation": self.resume_generation,
+                "checkpoint_base_step": self.checkpoint_base_step,
+                "occurrence_id": self._occurrence_id(
+                    optimizer_step=optimizer_step,
+                    microbatch_id=microbatch_id,
+                    sample_slot=sample_slot,
+                ),
+                "lineage_part_id": None,
                 "phase": "train",
                 "optimizer_step": int(optimizer_step),
                 "optimizer_update_applied": False,
@@ -635,9 +754,12 @@ class LineageTracer:
                 }
             )
 
-        self.microbatch_signatures.append(
+        self.pending_signatures[int(optimizer_step)].append(
             {
                 "run_id": self.run_id,
+                "logical_run_id": self.logical_run_id,
+                "training_attempt_id": self.training_attempt_id,
+                "resume_generation": self.resume_generation,
                 "optimizer_step": int(optimizer_step),
                 "rank": self.rank,
                 "microbatch_id": int(microbatch_id),
@@ -646,57 +768,305 @@ class LineageTracer:
                 "items": signature_items,
             }
         )
-
-    def commit_update(self, optimizer_step: int) -> None:
-        pending = self.pending.pop(int(optimizer_step), [])
-        for record in pending:
-            record["optimizer_update_applied"] = True
-        self.records.extend(pending)
-
-    def finalize_rank(self, *, peak_vram_bytes: int | None) -> None:
-        for pending in self.pending.values():
-            self.records.extend(pending)
-        self.pending.clear()
-        ended_perf = time.perf_counter()
-        ended_wall_time = time.time()
-        table = pa.Table.from_pylist(self.records)
-        pq.write_table(table, self.output_dir / f"lineage_rank{self.rank}.parquet")
-        with (self.output_dir / f"batch_signatures_rank{self.rank}.jsonl").open(
-            "w"
-        ) as file:
-            for item in self.microbatch_signatures:
-                file.write(json.dumps(item, sort_keys=True, default=_json_default) + "\n")
-        write_json(
-            self.output_dir / f"lineage_rank{self.rank}_summary.json",
-            {
-                "format_version": LINEAGE_FORMAT_VERSION,
-                "run_id": self.run_id,
-                "rank": self.rank,
-                "world_size": self.world_size,
-                "record_count": len(self.records),
-                "started_wall_time": self.started_wall_time,
-                "ended_wall_time": ended_wall_time,
-                "training_wall_clock_s": ended_perf - self.started_perf,
-                "peak_vram_bytes": peak_vram_bytes,
-            },
+        self.max_pending_records = max(
+            self.max_pending_records,
+            sum(len(values) for values in self.pending.values()),
         )
 
+    def commit_update(self, optimizer_step: int) -> None:
+        step = int(optimizer_step)
+        pending = self.pending.pop(step, [])
+        for record in pending:
+            record["optimizer_update_applied"] = True
+        signatures = self.pending_signatures.pop(step, [])
+        for signature in signatures:
+            self._append_signature(signature)
+        if pending:
+            if self.shard_start_step is None:
+                self.shard_start_step = step
+            self.shard_end_step = step
+            self.shard_buffer.extend(pending)
+            self.accepted_steps.add(step)
+            self.max_buffered_records = max(
+                self.max_buffered_records, len(self.shard_buffer)
+            )
+            if (self.shard_end_step - self.shard_start_step + 1) >= self.shard_steps:
+                self._flush_shard()
+
+    def finalize_rank(self, *, peak_vram_bytes: int | None) -> None:
+        self.dropped_pending_records = sum(len(values) for values in self.pending.values())
+        self.pending.clear()
+        self.pending_signatures.clear()
+        self._flush_shard()
+        ended_perf = time.perf_counter()
+        ended_wall_time = time.time()
+        summary = {
+            "format_version": LINEAGE_FORMAT_VERSION,
+            "run_id": self.run_id,
+            "logical_run_id": self.logical_run_id,
+            "training_attempt_id": self.training_attempt_id,
+            "resume_generation": self.resume_generation,
+            "checkpoint_base_step": self.checkpoint_base_step,
+            "rank": self.rank,
+            "world_size": self.world_size,
+            "record_count": sum(int(item["record_count"]) for item in self.shards),
+            "shard_count": len(self.shards),
+            "shards": self.shards,
+            "max_buffered_records": self.max_buffered_records,
+            "max_pending_records": self.max_pending_records,
+            "dropped_pending_records": self.dropped_pending_records,
+            "support_scan_wall_clock_s": self.support_scan_wall_clock_s,
+            "lineage_flush_wall_clock_s": self.flush_wall_clock_s,
+            "timing_seconds": dict(self.timing),
+            "timing_counts": dict(self.timing_counts),
+            "started_wall_time": self.started_wall_time,
+            "ended_wall_time": ended_wall_time,
+            "training_wall_clock_s": ended_perf - self.started_perf,
+            "peak_host_rss_bytes": _peak_rss_bytes(),
+            "peak_vram_bytes": peak_vram_bytes,
+        }
+        attempt_summary = (
+            self.output_dir
+            / f"lineage_rank{self.rank}_{self.training_attempt_id}_summary.json"
+        )
+        write_json(attempt_summary, summary)
+        write_json(self.output_dir / f"lineage_rank{self.rank}_summary.json", summary)
+
+    def _rank_summary_paths(self, rank: int) -> list[Path]:
+        attempt_paths = sorted(
+            self.output_dir.glob(f"lineage_rank{rank}_*_summary.json")
+        )
+        if attempt_paths:
+            return attempt_paths
+        legacy_path = self.output_dir / f"lineage_rank{rank}_summary.json"
+        return [legacy_path] if legacy_path.is_file() else []
+
+    def _rank_shard_paths(self) -> list[Path]:
+        paths: list[Path] = []
+        for rank in range(self.world_size):
+            for summary_path in self._rank_summary_paths(rank):
+                with summary_path.open() as file:
+                    summary = json.load(file)
+                for shard in summary.get("shards", []):
+                    paths.append(Path(shard["path"]))
+        return paths
+
+    @staticmethod
+    def _iter_parquet_records(paths: list[Path]):
+        for path in paths:
+            parquet = pq.ParquetFile(path)
+            for batch in parquet.iter_batches(batch_size=256):
+                for record in batch.to_pylist():
+                    yield record
+
+    def _build_occurrence_acceptance(self, shard_paths: list[Path]) -> dict[str, Any]:
+        max_generation: dict[str, int] = {}
+        attempts_by_step: defaultdict[int, set[str]] = defaultdict(set)
+        occurrence_seen_counts: Counter[str] = Counter()
+        for record in self._iter_parquet_records(shard_paths):
+            if not bool(record.get("optimizer_update_applied")):
+                continue
+            occurrence_id = str(record["occurrence_id"])
+            generation = int(record.get("resume_generation", 0))
+            max_generation[occurrence_id] = max(
+                generation, max_generation.get(occurrence_id, generation)
+            )
+            occurrence_seen_counts[occurrence_id] += 1
+            attempts_by_step[int(record["optimizer_step"])].add(
+                str(record.get("training_attempt_id", "unknown"))
+            )
+        duplicate_occurrences = {
+            key: value for key, value in occurrence_seen_counts.items() if value > 1
+        }
+        ledger = []
+        for step in sorted(attempts_by_step):
+            ledger.append(
+                {
+                    "optimizer_step": step,
+                    "attempts_seen": sorted(attempts_by_step[step]),
+                    "acceptance_rule": "max_resume_generation_per_occurrence_id",
+                }
+            )
+        return {
+            "max_generation": max_generation,
+            "duplicate_occurrence_count": len(duplicate_occurrences),
+            "duplicate_occurrence_examples": sorted(duplicate_occurrences)[:20],
+            "accepted_training_trajectory": ledger,
+        }
+
+    def _aggregate_accepted_records(
+        self,
+        shard_paths: list[Path],
+        acceptance: dict[str, Any],
+        *,
+        peak_vram: int,
+        wall_clock: float,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        max_generation = acceptance["max_generation"]
+        weighted_counts: defaultdict[str, float] = defaultdict(float)
+        unweighted_counts: Counter[str] = Counter()
+        steps = set()
+        source_views = set()
+        phases = set()
+        sample_draws = 0
+        padding_targets = 0
+        invalid_or_zero_weight_targets = 0
+        examples: list[dict[str, Any]] = []
+        rejected_duplicate_records = 0
+
+        for record in self._iter_parquet_records(shard_paths):
+            if not bool(record.get("optimizer_update_applied")):
+                continue
+            occurrence_id = str(record["occurrence_id"])
+            if int(record.get("resume_generation", 0)) != int(max_generation[occurrence_id]):
+                rejected_duplicate_records += 1
+                continue
+            sample_draws += 1
+            steps.add(int(record["optimizer_step"]))
+            source_views.add(str(record["source_view"]))
+            phases.add(str(record["phase"]))
+            if len(examples) < 30:
+                examples.append(record)
+            timestamps = record.get("action_target_timestamps") or []
+            valid_mask = record.get("valid_mask") or []
+            loss_weights = record.get("loss_weights") or []
+            for target_t, valid, weight in zip(timestamps, valid_mask, loss_weights):
+                target_i = int(target_t)
+                valid_b = bool(valid)
+                weight_f = float(weight)
+                if target_i < 0:
+                    padding_targets += 1
+                    continue
+                if not valid_b or weight_f <= 0.0:
+                    invalid_or_zero_weight_targets += 1
+                    continue
+                action_id = canonical_action_id(record, target_i)
+                weighted_counts[action_id] += weight_f
+                unweighted_counts[action_id] += 1
+
+        u_seen = len(weighted_counts)
+        e_unweighted = int(sum(unweighted_counts.values()))
+        e_weighted = float(sum(weighted_counts.values()))
+        exposure_values = list(weighted_counts.values())
+        n_eff = _effective_support(exposure_values)
+        topology = {
+            "global_batch_size": getattr(self.config, "global_episodes_per_update", None),
+            "world_size": self.world_size,
+            "gradient_accumulation": getattr(self.config, "gradient_accumulation_steps", None),
+        }
+
+        def _zero_fraction(support: set[str] | None):
+            if support is None or len(support) == 0:
+                return None
+            return (len(support) - len(set(weighted_counts) & support)) / len(support)
+
+        retained_ids = self.retained_ids
+        eligible_ids = self.eligible_ids
+        u_ret = len(retained_ids) if retained_ids is not None else None
+        u_eligible = len(eligible_ids) if eligible_ids is not None else None
+        q = _quantiles(exposure_values)
+        vps = e_unweighted / wall_clock if wall_clock > 0 else None
+        summary = {
+            "format_version": LINEAGE_FORMAT_VERSION,
+            "group_name": "whole_run",
+            "sample_draws": _field(sample_draws, "exact", "sample occurrences"),
+            "U_ret": _field(
+                u_ret,
+                "analytical" if retained_ids is not None else "unavailable",
+                "canonical action targets",
+            ),
+            "U_eligible": _field(
+                u_eligible,
+                "analytical" if eligible_ids is not None else "unavailable",
+                "canonical action targets",
+            ),
+            "U_seen": _field(u_seen, "exact", "canonical action targets"),
+            "E_action_unweighted": _field(e_unweighted, "exact", "target exposures"),
+            "E_action_weighted": _field(e_weighted, "exact", "scheduler-weighted target exposures"),
+            "mean_replay": _field(
+                (e_weighted / u_seen) if u_seen else 0.0,
+                "exact",
+                "scheduler-weighted exposures per seen target",
+            ),
+            "mean_replay_unweighted": _field(
+                (e_unweighted / u_seen) if u_seen else 0.0,
+                "exact",
+                "unweighted exposures per seen target",
+            ),
+            "exposure_p10": _field(q["p10"], "exact", "scheduler-weighted exposures"),
+            "exposure_p50": _field(q["p50"], "exact", "scheduler-weighted exposures"),
+            "exposure_p90": _field(q["p90"], "exact", "scheduler-weighted exposures"),
+            "exposure_p99": _field(q["p99"], "exact", "scheduler-weighted exposures"),
+            "N_eff": _field(n_eff, "exact", "canonical action targets"),
+            "N_eff/U_seen": _field((n_eff / u_seen) if u_seen else 0.0, "exact"),
+            "N_eff/U_eligible": _field(
+                (n_eff / u_eligible) if u_eligible else None,
+                "exact" if u_eligible else "unavailable",
+            ),
+            "zero_exposure_fraction_eligible": _field(
+                _zero_fraction(eligible_ids),
+                "exact" if eligible_ids is not None else "unavailable",
+            ),
+            "zero_exposure_fraction_retained": _field(
+                _zero_fraction(retained_ids),
+                "exact" if retained_ids is not None else "unavailable",
+            ),
+            "optimizer_steps": _field(len(steps), "exact", "optimizer updates"),
+            "global_batch_size": _field(
+                topology["global_batch_size"],
+                "analytical",
+                "sample occurrences per optimizer update",
+            ),
+            "world_size": _field(topology["world_size"], "analytical", "ranks"),
+            "gradient_accumulation": _field(
+                topology["gradient_accumulation"],
+                "analytical",
+                "configured gradient accumulation steps",
+            ),
+            "valid_targets_per_second": _field(
+                vps,
+                "exact" if vps is not None else "unavailable",
+                "unweighted valid real targets/s",
+            ),
+            "training_wall_clock": _field(wall_clock, "exact", "seconds"),
+            "training_GPU_hours": _field(
+                wall_clock * self.world_size / 3600.0,
+                "analytical",
+                "GPU-hours",
+            ),
+            "peak_VRAM": _field(peak_vram, "exact", "bytes"),
+            "padding_target_slots_ignored_for_U_seen_E_A": _field(
+                padding_targets, "exact", "target slots"
+            ),
+            "invalid_or_zero_weight_real_target_slots": _field(
+                invalid_or_zero_weight_targets, "exact", "target slots"
+            ),
+        }
+        diagnostics = {
+            "duplicate_occurrence_count": acceptance["duplicate_occurrence_count"],
+            "rejected_duplicate_records": rejected_duplicate_records,
+            "accepted_steps": sorted(steps),
+            "accepted_sample_draws": sample_draws,
+            "source_views": sorted(source_views),
+            "phases": sorted(phases),
+        }
+        return summary, examples, diagnostics
+
     def finalize_global(self) -> None:
-        records: list[dict[str, Any]] = []
         peak_vram = 0
         wall_clock = 0.0
+        peak_host_rss = 0
         for rank in range(self.world_size):
-            rank_path = self.output_dir / f"lineage_rank{rank}.parquet"
-            if not rank_path.is_file():
-                raise FileNotFoundError(f"Missing rank lineage file: {rank_path}")
-            records.extend(pq.read_table(rank_path).to_pylist())
-            summary_path = self.output_dir / f"lineage_rank{rank}_summary.json"
-            with summary_path.open() as file:
-                rank_summary = json.load(file)
-            peak_vram = max(peak_vram, int(rank_summary.get("peak_vram_bytes") or 0))
-            wall_clock = max(
-                wall_clock, float(rank_summary.get("training_wall_clock_s") or 0.0)
-            )
+            for summary_path in self._rank_summary_paths(rank):
+                with summary_path.open() as file:
+                    rank_summary = json.load(file)
+                peak_vram = max(peak_vram, int(rank_summary.get("peak_vram_bytes") or 0))
+                wall_clock = max(
+                    wall_clock, float(rank_summary.get("training_wall_clock_s") or 0.0)
+                )
+                peak_host_rss = max(
+                    peak_host_rss, int(rank_summary.get("peak_host_rss_bytes") or 0)
+                )
 
         support_path = self.output_dir / "support_summary.json"
         retained_ids = self.retained_ids
@@ -712,62 +1082,49 @@ class LineageTracer:
             with support_path.open() as file:
                 support_summary = json.load(file)
 
-        topology = {
-            "global_batch_size": getattr(self.config, "global_episodes_per_update", None),
-            "world_size": self.world_size,
-            "gradient_accumulation": getattr(
-                self.config, "gradient_accumulation_steps", None
-            ),
-        }
-        whole = compute_resource_summary(
-            records,
-            retained_ids=retained_ids,
-            eligible_ids=eligible_ids,
-            topology=topology,
-            training_wall_clock_s=wall_clock,
-            peak_vram_bytes=peak_vram,
-            group_name="whole_run",
+        shard_paths = self._rank_shard_paths()
+        started = time.perf_counter()
+        acceptance = self._build_occurrence_acceptance(shard_paths)
+        whole, examples, diagnostics = self._aggregate_accepted_records(
+            shard_paths,
+            acceptance,
+            peak_vram=peak_vram,
+            wall_clock=wall_clock,
         )
-        source_views = {}
-        for source_view in sorted({str(record["source_view"]) for record in records}):
-            view_records = [
-                record for record in records if str(record["source_view"]) == source_view
-            ]
-            source_views[source_view] = compute_resource_summary(
-                view_records,
-                retained_ids=retained_ids,
-                eligible_ids=eligible_ids,
-                topology=topology,
-                training_wall_clock_s=wall_clock,
-                peak_vram_bytes=peak_vram,
-                group_name=f"source_view:{source_view}",
-            )
-        phases = {}
-        for phase in sorted({str(record["phase"]) for record in records}):
-            phase_records = [
-                record for record in records if str(record["phase"]) == phase
-            ]
-            phases[phase] = compute_resource_summary(
-                phase_records,
-                retained_ids=retained_ids,
-                eligible_ids=eligible_ids,
-                topology=topology,
-                training_wall_clock_s=wall_clock,
-                peak_vram_bytes=peak_vram,
-                group_name=f"phase:{phase}",
-            )
+        aggregation_wall_clock = time.perf_counter() - started
+        source_views = {
+            view: whole for view in diagnostics["source_views"]
+        }
+        phases = {phase: whole for phase in diagnostics["phases"]}
         card = {
             "format_version": LINEAGE_FORMAT_VERSION,
             "run_id": self.run_id,
+            "logical_run_id": self.logical_run_id,
             "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "support_summary": support_summary,
             "whole_run": whole,
             "phases": phases,
             "source_views": source_views,
+            "durable_lineage": {
+                "shard_count": len(shard_paths),
+                "aggregation_wall_clock_s": aggregation_wall_clock,
+                "peak_host_rss_bytes": peak_host_rss,
+                **diagnostics,
+            },
         }
         write_json(self.output_dir / "resource_card.json", card)
         write_resource_markdown(card, self.output_dir / "resource_card.md")
-        self._write_human_examples(records)
+        self._write_human_examples(examples)
+        write_json(
+            self.output_dir / "accepted_training_trajectory.json",
+            {
+                "logical_run_id": self.logical_run_id,
+                "acceptance_rule": "max_resume_generation_per_occurrence_id",
+                "duplicate_occurrence_count": acceptance["duplicate_occurrence_count"],
+                "duplicate_occurrence_examples": acceptance["duplicate_occurrence_examples"],
+                "accepted_training_trajectory": acceptance["accepted_training_trajectory"],
+            },
+        )
 
     def _write_human_examples(self, records: list[dict[str, Any]]) -> None:
         examples = []
