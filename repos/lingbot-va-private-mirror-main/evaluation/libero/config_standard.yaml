@@ -1,0 +1,5 @@
+benchmark_root: /data/zouyude/LIBERO/libero/libero
+bddl_files: /data/zouyude/LIBERO/libero/libero/bddl_files
+init_states: /data/zouyude/LIBERO/libero/libero/init_files
+datasets: /data/zouyude/LIBERO/libero/datasets
+assets: /data/zouyude/LIBERO/libero/libero/assets

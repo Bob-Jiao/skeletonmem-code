@@ -1,0 +1,103 @@
+# Stage2-Gate A: Full-Data Benchmark Qualification candidates.
+# Rule: a task is not eligible for selector comparison until full-data fine-tuning
+# yields a stable, nonzero closed-loop signal under a frozen eval protocol.
+
+gate_name: Stage2-Gate-A-Full-Data-Benchmark-Qualification
+workspace_rule:
+  writable_root: /data/jiaoguanbo/skeletonmem
+  external_roots: read_only_or_download_only
+  source_code_policy:
+    active_lingbot_worktree: /data/jiaoguanbo/skeletonmem/worktrees/lingbot-va-stage2-gatea
+    do_not_mix_with: /data/jiaoguanbo/lingbot-va
+    official_remote: https://github.com/robbyant/lingbot-va.git
+    official_commit: 7c6ffa9bfc4b83582cafc860fab4c82cc7deeeeb
+    runtime_patch: /data/jiaoguanbo/skeletonmem/results/stage2/gate_a/lingbot_stage2_gatea_minimal_runtime.patch
+  checkpoint_policy:
+    shared_checkpoint_root_allowed: /data/jiaoguanbo/models
+    rule: checkpoints may be shared from the main directory, but every run must record the exact checkpoint path and whether it is base, released posttrain, or locally fine-tuned.
+
+global_training_contract:
+  policy: LingBot-VA
+  num_gpus: 2
+  init_checkpoint_default: /data/jiaoguanbo/models/lingbot-va-base
+  checkpoint_selection: validation_loss_then_fixed_eval
+  selector_sweep_allowed: false
+  required_before_selector:
+    - full_data_train_loss_not_nan
+    - full_data_validation_loss_has_normal_signal
+    - closed_loop_success_nonzero_or_stage_progress_nonzero
+    - observation_action_interface_checked
+    - data_training_eval_versions_recorded
+
+candidates:
+  - id: libero_official
+    priority: 1
+    benchmark: LIBERO
+    role: preferred_if_training_data_exists
+    eval_status:
+      released_checkpoint_clean_smoke: 1/1
+      older_local_record: 49/50 on libero_10 task 0
+    training_data_status:
+      official_lingbot_latent_data_found: false
+      local_available_data: /data/jiaoguanbo/skeletonmem/data/stage1/libero_contract_proxy_2ep
+      local_available_data_note: contract proxy only; not official LIBERO-LONG training data
+    config_contract:
+      train_config: libero_train
+      cameras:
+        - observation.images.agentview_rgb
+        - observation.images.eye_in_hand_rgb
+      action_dim_raw: 7
+      action_dim_model: 30
+    gate_a_status: blocked_by_missing_official_training_data
+    next_action: locate_or_download_official_LingBot_LIBERO_latent_training_data; otherwise skip to RoboTwin engineering baseline
+
+  - id: robotwin_adjust_bottle
+    priority: 2
+    benchmark: RoboTwin
+    task: adjust_bottle
+    role: engineering_sanity_baseline_only
+    eval_status:
+      released_checkpoint_clean_smoke: 1/1
+    training_data_status:
+      local_full_50_raw_episodes: /data/jiaoguanbo/datasets/official-robotwin-adjust-bottle-audit/lerobot_robotwin_eef_clean_50/adjust_bottle-demo_clean_collect_200-50
+      lingbot_train_smoke_data: /data/jiaoguanbo/skeletonmem/data/stage1/robotwin_official_2ep
+      note: local 50-episode root has only a few latent files in current audit; full LingBot latent training data may need regeneration
+    config_contract:
+      train_config: robotwin_train
+      cameras:
+        - observation.images.cam_high
+        - observation.images.cam_left_wrist
+        - observation.images.cam_right_wrist
+      action_dim_raw: 16
+      action_dim_model: 30
+    gate_a_status: candidate_for_pipeline_qualification
+    next_action: verify complete latent coverage or regenerate latents; then run full-data short fine-tune and closed-loop eval
+
+  - id: robotwin_mem_pick_objects_in_order
+    priority: 3
+    benchmark: RoboTwin-Mem
+    task: pick_objects_in_order
+    role: memory_heavy_probe_only_until_full_baseline_works
+    eval_status:
+      existing_lingbot_success_range: 0.0_to_0.0
+      existing_reward_range: 0.0_to_0.56
+    training_data_status:
+      local_lingbot_latent_data: /data/jiaoguanbo/datasets/robotwin-mem-lingbot-official-hf-tailfixed/pick_objects_in_order-demo_clean
+      episodes: 50
+      segments: 850
+    gate_a_status: not_qualified
+    next_action: only run full-data qualification probe; no selector sweep until full closed-loop signal is nonzero
+
+  - id: rmbench_cover_blocks
+    priority: 4
+    benchmark: RMBench
+    task: cover_blocks
+    role: memory_task_probe_only
+    eval_status:
+      existing_full_data_closed_loop: unknown_or_not_runnable
+    training_data_status:
+      local_lingbot_latent_data: /data/jiaoguanbo/datasets/20260817_rmbench_lingbot_official_hdf5_tailfixed_001/cover_blocks-demo_clean
+      episodes: 50
+      segments: 768
+    gate_a_status: not_qualified
+    next_action: only run full-data qualification probe after LIBERO/adjust_bottle status is resolved
