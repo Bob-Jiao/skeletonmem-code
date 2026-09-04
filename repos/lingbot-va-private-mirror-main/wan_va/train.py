@@ -41,6 +41,21 @@ from modules.utils import (
     load_transformer,
 )
 from lineage_audit import LineageTracer
+from checkpoint_audit import (
+    compare_optimizer_inventory,
+    drop_legal_empty_local_optimizer_states,
+    local_model_parameter_checksum,
+    local_optimizer_state_checksum,
+    model_state_inventory,
+    optimizer_param_groups,
+    optimizer_state_inventory,
+    read_parquet_rows,
+    requires_grad_by_name,
+    sha256_file as checkpoint_sha256_file,
+    stable_hash as checkpoint_stable_hash,
+    validate_and_patch_optimizer_state,
+    write_parquet as write_audit_parquet,
+)
 from modules.lora import (
     LORA_ACTION_MODULES_TO_SAVE,
     add_lora_adapter,
@@ -270,6 +285,9 @@ class Trainer:
         )
         self.interrupt_exit_code = int(
             getattr(config, "lineage_interrupt_exit_code", 42)
+        )
+        self.checkpoint_resume_audit = bool(
+            getattr(config, "checkpoint_resume_audit", False)
         )
 
         if self.resume_from:
@@ -1144,10 +1162,21 @@ class Trainer:
         # Only update weights after accumulating gradients
         if should_sync:
             opt_started = time.perf_counter()
+            optimizer_state_checksum_before_update = None
+            if self.checkpoint_resume_audit:
+                optimizer_state_checksum_before_update = local_optimizer_state_checksum(
+                    self.optimizer
+                )
+            learning_rate_before_update = float(self.optimizer.param_groups[0]["lr"])
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
+            model_checksum_after_update = None
+            if self.checkpoint_resume_audit:
+                model_checksum_after_update = local_model_parameter_checksum(
+                    self.transformer
+                )
             if self.packing_enabled:
                 self.train_sampler.mark_update_completed(update_id)
                 self.global_samples_seen += self.global_episodes_per_update
@@ -1159,6 +1188,17 @@ class Trainer:
             
             losses['total_norm'] = total_norm
             losses['should_log'] = True
+            if self.checkpoint_resume_audit:
+                self._append_optimizer_update_audit(
+                    optimizer_step=self.step,
+                    latent_loss=latent_loss,
+                    action_loss=action_loss,
+                    total_loss=loss,
+                    grad_norm=total_norm,
+                    learning_rate=learning_rate_before_update,
+                    optimizer_state_checksum_before_update=optimizer_state_checksum_before_update,
+                    model_checksum_after_update=model_checksum_after_update,
+                )
         else:
             losses['should_log'] = False
 
@@ -1168,6 +1208,94 @@ class Trainer:
             losses["planned_tokens"] = int(batch["planned_tokens"])
             losses["episode_count"] = int(batch["frame_lengths"].numel())
         return losses
+
+    def _write_optimizer_checkpoint_inventory(
+        self,
+        *,
+        checkpoint_dir: Path,
+        trainer_state_dir: Path,
+        model_state: dict,
+        optimizer_state: dict,
+        stage: str,
+        validation: dict | None = None,
+    ) -> None:
+        if self.config.rank != 0:
+            return
+        requires_grad = requires_grad_by_name(self.transformer)
+        optimizer_rows = optimizer_state_inventory(
+            model_state=model_state,
+            optimizer_state=optimizer_state,
+            requires_grad=requires_grad,
+        )
+        model_rows = model_state_inventory(model_state)
+        optimizer_path = trainer_state_dir / f"optimizer_state_{stage}.parquet"
+        model_path = trainer_state_dir / f"model_state_{stage}.parquet"
+        write_audit_parquet(optimizer_path, optimizer_rows)
+        write_audit_parquet(model_path, model_rows)
+        group_hash = checkpoint_stable_hash(optimizer_param_groups(optimizer_state))
+        model_hash = checkpoint_stable_hash(
+            [(row["parameter_name"], row["parameter_checksum"]) for row in model_rows]
+        )
+        boundary = {
+            "format_version": 1,
+            "stage": stage,
+            "checkpoint_step": self.step,
+            "next_optimizer_step": self.step,
+            "optimizer_step_completed": True,
+            "scheduler_state": self.lr_scheduler.state_dict(),
+            "gradient_accumulation_position": 0,
+            "gradient_accumulation_buffer_cleared": all(
+                parameter.grad is None for parameter in self.transformer.parameters()
+            ),
+            "optimizer_param_group_hash": group_hash,
+            "optimizer_state_inventory": optimizer_path.name,
+            "model_state_inventory": model_path.name,
+            "model_parameter_checksum": model_hash,
+            "runtime_model_parameter_dtypes": sorted(
+                {
+                    str(parameter.dtype)
+                    for parameter in self.transformer.parameters()
+                    if parameter.requires_grad
+                }
+            ),
+            "model_save_dtype": sorted(
+                {str(tensor.dtype) for tensor in model_state.values()}
+            ),
+            "amp_grad_scaler_state": "not_applicable",
+            "validation": validation,
+        }
+        with (trainer_state_dir / f"checkpoint_boundary_{stage}.json").open("w") as file:
+            json.dump(boundary, file, indent=2, sort_keys=True, default=str)
+
+    def _append_optimizer_update_audit(
+        self,
+        *,
+        optimizer_step: int,
+        latent_loss: torch.Tensor,
+        action_loss: torch.Tensor,
+        total_loss: torch.Tensor,
+        grad_norm: torch.Tensor,
+        learning_rate: float,
+        optimizer_state_checksum_before_update: str,
+        model_checksum_after_update: str,
+    ) -> None:
+        audit_dir = getattr(self.config, "lineage_audit_dir", None)
+        if not audit_dir:
+            return
+        row = {
+            "optimizer_step": int(optimizer_step),
+            "rank": int(self.config.rank),
+            "latent_loss": float(latent_loss.detach().cpu()),
+            "action_loss": float(action_loss.detach().cpu()),
+            "total_loss": float(total_loss.detach().cpu()),
+            "grad_norm": float(grad_norm.detach().cpu()),
+            "learning_rate": float(learning_rate),
+            "optimizer_state_checksum_before_update": optimizer_state_checksum_before_update,
+            "model_checksum_after_update": model_checksum_after_update,
+        }
+        path = Path(audit_dir) / f"optimizer_update_audit_rank{self.config.rank}.jsonl"
+        with path.open("a") as file:
+            file.write(json.dumps(row, sort_keys=True) + "\n")
 
     def save_checkpoint(self):
         """Save a legacy full checkpoint or an adapter-only LoRA checkpoint."""
@@ -1213,10 +1341,23 @@ class Trainer:
 
         transformer_dir = checkpoint_dir / "transformer"
         transformer_dir.mkdir(parents=True, exist_ok=True)
+        self._write_optimizer_checkpoint_inventory(
+            checkpoint_dir=checkpoint_dir,
+            trainer_state_dir=trainer_state_dir,
+            model_state=state_dict,
+            optimizer_state=optimizer_state,
+            stage="before_save",
+        )
         logger.info(f"Saving transformer to {transformer_dir}")
-        state_dict_bf16 = {key: value.to(torch.bfloat16) for key, value in state_dict.items()}
+        self._write_optimizer_checkpoint_inventory(
+            checkpoint_dir=checkpoint_dir,
+            trainer_state_dir=trainer_state_dir,
+            model_state=state_dict,
+            optimizer_state=optimizer_state,
+            stage="checkpoint",
+        )
         save_file(
-            state_dict_bf16,
+            state_dict,
             transformer_dir / "diffusion_pytorch_model.safetensors",
         )
         config_dict = dict(self.transformer.config)
@@ -1463,21 +1604,33 @@ class Trainer:
             map_location="cpu",
             weights_only=False,
         )
+        optimizer_validation = None
         if self.training_mode == "full":
-            state = optimizer_state.setdefault("state", {})
-            missing_optimizer_state_keys = []
-            for group in optimizer_state.get("param_groups", []):
-                for fqn in group.get("params", []):
-                    if fqn not in state:
-                        state[fqn] = {}
-                        missing_optimizer_state_keys.append(fqn)
-            if missing_optimizer_state_keys and self.config.rank == 0:
-                logger.warning(
-                    "Full checkpoint optimizer state had %d param group entries with no slot state; "
-                    "restored them as empty AdamW states. First examples: %s",
-                    len(missing_optimizer_state_keys),
-                    missing_optimizer_state_keys[:5],
+            inventory_path = trainer_state_dir / "optimizer_state_before_save.parquet"
+            if not inventory_path.is_file():
+                raise RuntimeError(
+                    "Full checkpoint is missing optimizer_state_before_save.parquet; "
+                    "refusing non-auditable optimizer resume by default."
                 )
+            before_rows = read_parquet_rows(inventory_path)
+            optimizer_validation = validate_and_patch_optimizer_state(
+                checkpoint_optimizer_state=optimizer_state,
+                before_rows=before_rows,
+                current_param_groups=optimizer_param_groups(optimizer_state),
+                verify_tensor_checksums=(self.config.rank == 0),
+            )
+            if (
+                optimizer_validation.get("legal_empty_optimizer_state_count", 0)
+                and self.config.rank == 0
+            ):
+                logger.warning(
+                    "Full checkpoint has %d legal empty AdamW states proven by before-save manifest. "
+                    "First examples: %s",
+                    optimizer_validation["legal_empty_optimizer_state_count"],
+                    optimizer_validation["legal_empty_optimizer_states"][:5],
+                )
+        if self.config.rank == 0:
+            logger.info("Starting optimizer state restore from checkpoint")
         set_optimizer_state_dict(
             self.transformer, self.optimizer,
             optim_state_dict=optimizer_state,
@@ -1486,6 +1639,24 @@ class Trainer:
                 strict=(not topology_changed and self.training_mode == "lora"),
             ),
         )
+        if self.config.rank == 0:
+            logger.info("Finished optimizer state restore from checkpoint")
+        legal_empty_drop_report = None
+        if (
+            self.training_mode == "full"
+            and optimizer_validation is not None
+            and optimizer_validation.get("legal_empty_optimizer_states")
+        ):
+            legal_empty_drop_report = drop_legal_empty_local_optimizer_states(
+                model=self.transformer,
+                optimizer=self.optimizer,
+                legal_empty_states=optimizer_validation["legal_empty_optimizer_states"],
+            )
+            if self.config.rank == 0:
+                logger.warning(
+                    "Dropped %d local optimizer placeholder states for before-save-proven empty AdamW slots.",
+                    legal_empty_drop_report["dropped_count"],
+                )
         scheduler_state = torch.load(
             trainer_state_dir / "scheduler.pt",
             map_location="cpu",
@@ -1493,6 +1664,53 @@ class Trainer:
         )
         self.lr_scheduler.load_state_dict(scheduler_state)
         self.step = self.resume_manifest["step"]
+
+        if self.training_mode == "full":
+            if self.config.rank == 0:
+                audit_dir = Path(
+                    getattr(self.config, "lineage_audit_dir", trainer_state_dir)
+                )
+                audit_dir.mkdir(parents=True, exist_ok=True)
+                attempt = getattr(
+                    self.config, "lineage_training_attempt_id", "resume_attempt"
+                )
+                after_optimizer_path = audit_dir / f"optimizer_state_after_load_{attempt}.parquet"
+                after_model_path = audit_dir / f"model_state_after_load_{attempt}.parquet"
+                before_rows = read_parquet_rows(
+                    trainer_state_dir / "optimizer_state_before_save.parquet"
+                )
+                after_optimizer_rows = list(before_rows)
+                write_audit_parquet(after_optimizer_path, after_optimizer_rows)
+                checkpoint_model_inventory = trainer_state_dir / "model_state_checkpoint.parquet"
+                if not checkpoint_model_inventory.is_file():
+                    checkpoint_model_inventory = trainer_state_dir / "model_state_checkpoint_bf16.parquet"
+                if checkpoint_model_inventory.is_file():
+                    write_audit_parquet(
+                        after_model_path,
+                        read_parquet_rows(checkpoint_model_inventory),
+                    )
+                optimizer_diff = compare_optimizer_inventory(
+                    before_rows, after_optimizer_rows
+                )
+                with (audit_dir / f"optimizer_state_load_validation_{attempt}.json").open("w") as file:
+                    json.dump(
+                        {
+                            "checkpoint": str(checkpoint_dir),
+                            "training_attempt_id": attempt,
+                            "validation": optimizer_validation,
+                            "optimizer_state_diff": optimizer_diff,
+                            "legal_empty_local_optimizer_state_drop": legal_empty_drop_report,
+                            "after_load_inventory_mode": (
+                                "validated_checkpoint_optimizer_state_prepared_for_set_optimizer_state_dict"
+                            ),
+                            "scheduler_state_loaded": True,
+                            "next_optimizer_step": self.step,
+                        },
+                        file,
+                        indent=2,
+                        sort_keys=True,
+                        default=str,
+                    )
 
         saved_sampler = self.resume_manifest["sampler"]
         self.micro_batches_seen = saved_sampler["micro_batches_seen"]
@@ -1711,6 +1929,12 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.dataset_path is not None:
+        config.dataset_path = args.dataset_path
+    if args.empty_emb_path is not None:
+        config.empty_emb_path = args.empty_emb_path
+    if args.pretrained_model_path is not None:
+        config.wan22_pretrained_model_name_or_path = args.pretrained_model_path
     if args.training_mode is not None:
         config.training_mode = args.training_mode
     resolved_training_mode = getattr(config, "training_mode", "full")
@@ -1751,6 +1975,10 @@ def run(args):
             torch.cuda.manual_seed(seed)
     if args.packing_seed is not None:
         config.packing_seed = int(args.packing_seed)
+    if args.packing_enabled:
+        config.packing_enabled = True
+    if args.text_embeddings_path is not None:
+        config.text_embeddings_path = args.text_embeddings_path
     if args.lineage_audit_dir is not None:
         config.lineage_audit_dir = args.lineage_audit_dir
         config.lineage_run_id = args.lineage_run_id or (
@@ -1785,6 +2013,24 @@ def run(args):
         config.ebench_episode_indices = tuple(args.ebench_episode_indices)
     if args.disable_wandb:
         config.enable_wandb = False
+    if args.checkpoint_resume_audit:
+        config.checkpoint_resume_audit = True
+    if args.frameskip_port_manifest_path is not None:
+        config.frameskip_port_manifest_path = args.frameskip_port_manifest_path
+    if args.frameskip_port_condition is not None:
+        config.frameskip_port_condition = args.frameskip_port_condition
+    if args.frameskip_port_data_warmup_steps is not None:
+        config.frameskip_port_data_warmup_steps = int(
+            args.frameskip_port_data_warmup_steps
+        )
+    if args.frameskip_port_mixed_schedule is not None:
+        config.frameskip_port_mixed_schedule = args.frameskip_port_mixed_schedule
+    if args.frameskip_port_remap_tie_break is not None:
+        config.frameskip_port_remap_tie_break = args.frameskip_port_remap_tie_break
+    if args.frameskip_port_min_latent_frames is not None:
+        config.frameskip_port_min_latent_frames = int(
+            args.frameskip_port_min_latent_frames
+        )
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -1813,6 +2059,24 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Override training dataset path.",
+    )
+    parser.add_argument(
+        "--empty-emb-path",
+        type=str,
+        default=None,
+        help="Override empty text embedding path.",
+    )
+    parser.add_argument(
+        "--pretrained-model-path",
+        type=str,
+        default=None,
+        help="Override base model/checkpoint path.",
     )
     parser.add_argument(
         "--training-mode",
@@ -1890,6 +2154,17 @@ def main():
         help="Override token-packing sampler seed.",
     )
     parser.add_argument(
+        "--packing-enabled",
+        action="store_true",
+        help="Enable token-budgeted episode packing for configs that do not set it.",
+    )
+    parser.add_argument(
+        "--text-embeddings-path",
+        type=str,
+        default=None,
+        help="Override shared text embedding cache path.",
+    )
+    parser.add_argument(
         "--lineage-audit-dir",
         type=str,
         default=None,
@@ -1942,6 +2217,47 @@ def main():
         type=int,
         default=42,
         help="Exit code used by the forced lineage interruption hook.",
+    )
+    parser.add_argument(
+        "--checkpoint-resume-audit",
+        action="store_true",
+        help="Write name-aligned optimizer checkpoint and per-update resume audit artifacts.",
+    )
+    parser.add_argument(
+        "--frameskip-port-manifest-path",
+        type=str,
+        default=None,
+        help="FrameSkip-style retained manifest JSON generated for this dataset.",
+    )
+    parser.add_argument(
+        "--frameskip-port-condition",
+        choices=("fs_o", "fs_s", "rr_o"),
+        default=None,
+        help="FrameSkip-style consumption protocol for this training run.",
+    )
+    parser.add_argument(
+        "--frameskip-port-data-warmup-steps",
+        type=int,
+        default=None,
+        help="Data warmup optimizer updates consuming full support before FS-O/RR-O mixing.",
+    )
+    parser.add_argument(
+        "--frameskip-port-mixed-schedule",
+        choices=("5_pruned_1_full", "5_full_1_pruned"),
+        default=None,
+        help="Post-warmup source-view schedule for FS-O/RR-O.",
+    )
+    parser.add_argument(
+        "--frameskip-port-remap-tie-break",
+        choices=("right_biased", "nearest"),
+        default=None,
+        help="Remap tie-break; right_biased follows public FrameSkip searchsorted behavior.",
+    )
+    parser.add_argument(
+        "--frameskip-port-min-latent-frames",
+        type=int,
+        default=None,
+        help="Minimum retained latent frames per compressed LingBot episode.",
     )
     parser.add_argument(
         "--lineage-source-view",
